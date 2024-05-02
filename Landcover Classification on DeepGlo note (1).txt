@@ -1,0 +1,357 @@
+Landcover Classification on DeepGlobe with NestedUnet
+Install & Import Dependencies
+!pip install -q git+https://github.com/PyTorchLightning/pytorch-lightning
+!pip install -q git+https://github.com/qubvel/segmentation_models.pytorch
+!pip install -q git+https://github.com/albumentations-team/albumentations
+!pip install -q torchinfo
+ERROR: pip's dependency resolver does not currently take into account all the packages that are installed. This behaviour is the source of the following dependency conflicts.
+boto3 1.24.56 requires botocore<1.28.0,>=1.27.56, but you have botocore 1.24.21 which is incompatible.
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+import os
+import cv2
+import torch
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+import pytorch_lightning as pl
+from torch import nn
+from tqdm.notebook import tqdm
+Extract Data
+IMAGE_SIZE = 320
+BATCH_SIZE = 16
+EPOCHS = 5
+
+color_dict = pd.read_csv('../input/deepglobe-land-cover-classification-dataset/class_dict.csv')
+CLASSES = color_dict['name']
+print(color_dict)
+               name    r    g    b
+0        urban_land    0  255  255
+1  agriculture_land  255  255    0
+2         rangeland  255    0  255
+3       forest_land    0  255    0
+4             water    0    0  255
+5       barren_land  255  255  255
+6           unknown    0    0    0
+from glob import glob
+from sklearn.utils import shuffle
+
+pd_dataset = pd.DataFrame({
+    'IMAGES': sorted(glob("../input/deepglobe-land-cover-classification-dataset/train/*.jpg")), 
+    'MASKS': sorted(glob("../input/deepglobe-land-cover-classification-dataset/train/*.png"))
+})
+pd_dataset = shuffle(pd_dataset)
+pd_dataset.reset_index(inplace=True, drop=True)
+pd_dataset.head()
+IMAGES	MASKS
+0	../input/deepglobe-land-cover-classification-d...	../input/deepglobe-land-cover-classification-d...
+1	../input/deepglobe-land-cover-classification-d...	../input/deepglobe-land-cover-classification-d...
+2	../input/deepglobe-land-cover-classification-d...	../input/deepglobe-land-cover-classification-d...
+3	../input/deepglobe-land-cover-classification-d...	../input/deepglobe-land-cover-classification-d...
+4	../input/deepglobe-land-cover-classification-d...	../input/deepglobe-land-cover-classification-d...
+from sklearn.model_selection import train_test_split
+
+pd_train, pd_test = train_test_split(pd_dataset, test_size=0.25, random_state=0)
+pd_train, pd_val = train_test_split(pd_train, test_size=0.2, random_state=0)
+
+print("Training set size:", len(pd_train))
+print("Validation set size:", len(pd_val))
+print("Testing set size:", len(pd_test))
+Training set size: 481
+Validation set size: 121
+Testing set size: 201
+index = 200
+
+sample_img = cv2.imread(pd_train.iloc[index].IMAGES)
+sample_img = cv2.cvtColor(sample_img, cv2.COLOR_BGR2RGB)
+
+sample_msk = cv2.imread(pd_train.iloc[index].MASKS)
+sample_msk = cv2.cvtColor(sample_msk, cv2.COLOR_BGR2RGB)
+
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 10))
+
+ax1.set_title('IMAGE')
+ax1.imshow(sample_img)
+
+ax2.set_title('MASK')
+ax2.imshow(sample_msk)
+<matplotlib.image.AxesImage at 0x7f20ef6a19d0>
+
+Utility Functions
+def rgb2category(rgb_mask):
+    category_mask = np.zeros(rgb_mask.shape[:2], dtype=np.int8)
+    for i, row in color_dict.iterrows():
+        category_mask += (np.all(rgb_mask.reshape((-1, 3)) == (row['r'], row['g'], row['b']), axis=1).reshape(rgb_mask.shape[:2]) * i)
+    return category_mask
+
+def category2rgb(category_mask):
+    rgb_mask = np.zeros(category_mask.shape[:2] + (3,))
+    for i, row in color_dict.iterrows():
+        rgb_mask[category_mask==i] = (row['r'], row['g'], row['b'])
+    return np.uint8(rgb_mask)
+Data Augmentations & Transformations
+import albumentations as aug
+
+train_augment = aug.Compose([
+    aug.Resize(IMAGE_SIZE, IMAGE_SIZE),
+    aug.HorizontalFlip(p=0.5),
+    aug.VerticalFlip(p=0.5),
+    aug.RandomBrightnessContrast(p=0.3)
+])
+
+test_augment = aug.Compose([
+    aug.Resize(IMAGE_SIZE, IMAGE_SIZE),
+    aug.RandomBrightnessContrast(p=0.3)
+])
+Create PyTorch Dataset
+from torch.utils.data import Dataset, DataLoader
+
+class SegmentationDataset(Dataset):
+    def __init__(self, df, augmentations=None):
+        self.df = df
+        self.augmentations = augmentations
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, index: int):
+        row = self.df.iloc[index]
+
+        image = cv2.imread(row.IMAGES)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        mask = cv2.imread(row.MASKS)
+        mask = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        if self.augmentations:
+            data = self.augmentations(image=image, mask=mask)
+            image = data['image']
+            mask = data['mask']
+        
+        mask = rgb2category(mask)
+
+        image = np.transpose(image, (2, 0, 1)).astype(np.float64)
+        mask = np.expand_dims(mask, axis=0)
+
+        image = torch.Tensor(image) / 255.0
+        mask = torch.Tensor(mask).long()
+
+        return image, mask
+class SegmentationDataModule(pl.LightningDataModule):
+    def __init__(self, pd_train, pd_val, pd_test, batch_size=10):
+        super().__init__()
+        self.pd_train = pd_train
+        self.pd_val = pd_val
+        self.pd_test = pd_test
+        self.batch_size=batch_size
+
+    def setup(self, stage=None):
+        self.train_dataset = SegmentationDataset(self.pd_train, train_augment)
+        self.val_dataset = SegmentationDataset(self.pd_val, test_augment)
+        self.test_dataset = SegmentationDataset(self.pd_test, test_augment)
+
+    def train_dataloader(self):
+        return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=2)
+
+    def val_dataloader(self):
+        return DataLoader(self.val_dataset, batch_size=self.batch_size // 2, shuffle=False, num_workers=1)
+
+    def test_dataloader(self):
+        return DataLoader(self.test_dataset, batch_size=self.batch_size // 2, shuffle=False, num_workers=1)
+data_module = SegmentationDataModule(pd_train, pd_val, pd_test, batch_size=BATCH_SIZE)
+data_module.setup()
+image, mask = next(iter(data_module.train_dataloader()))
+image.shape, mask.shape
+(torch.Size([16, 3, 320, 320]), torch.Size([16, 1, 320, 320]))
+Build Loss and Model
+from segmentation_models_pytorch import UnetPlusPlus
+from segmentation_models_pytorch.losses import DiceLoss
+from segmentation_models_pytorch.metrics import get_stats, iou_score, accuracy, precision, recall, f1_score
+
+class SegmentationModel(pl.LightningModule):
+    def __init__(self):
+        super().__init__()
+        self.model = UnetPlusPlus(
+            encoder_name="timm-regnety_120",
+            encoder_weights="imagenet",
+            in_channels=3,
+            classes=len(CLASSES),
+            activation="softmax"
+        )
+        self.criterion = DiceLoss(mode="multiclass", from_logits=False)
+    
+    def forward(self, inputs, targets=None):
+        outputs = self.model(inputs)
+        if targets is not None:
+            loss = self.criterion(outputs, targets)
+            tp, fp, fn, tn = get_stats(outputs.argmax(dim=1).unsqueeze(1).type(torch.int64), targets, mode='multiclass', num_classes=len(CLASSES))
+            metrics = {
+                "Accuracy": accuracy(tp, fp, fn, tn, reduction="micro-imagewise"),
+                "IoU": iou_score(tp, fp, fn, tn, reduction="micro-imagewise"),
+                "Precision": precision(tp, fp, fn, tn, reduction="micro-imagewise"),
+                "Recall": recall(tp, fp, fn, tn, reduction="micro-imagewise"),
+                "F1score": f1_score(tp, fp, fn, tn, reduction="micro-imagewise")
+            }
+            return loss, metrics, outputs
+        else: 
+            return outputs
+
+    def configure_optimizers(self):
+        return torch.optim.AdamW(self.parameters(), lr=0.0001)
+
+    def training_step(self, batch, batch_idx):
+        images, masks = batch
+
+        loss, metrics, outputs = self(images, masks)
+        self.log_dict({
+            "train/Loss": loss,
+            "train/IoU": metrics['IoU'],
+            "train/Accuracy": metrics['Accuracy'],
+            "train/Precision": metrics['Precision'],
+            "train/Recall": metrics['Recall'],
+            "train/F1score": metrics['F1score']
+        }, prog_bar=True, logger=True, on_step=False, on_epoch=True)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        images, masks = batch
+
+        loss, metrics, outputs = self(images, masks)
+        self.log_dict({
+            "val/Loss": loss,
+            "val/IoU": metrics['IoU'],
+            "val/Accuracy": metrics['Accuracy'],
+            "val/Precision": metrics['Precision'],
+            "val/Recall": metrics['Recall'],
+            "val/F1score": metrics['F1score']
+        }, prog_bar=True, logger=True, on_step=False, on_epoch=True)
+        return loss
+
+    def test_step(self, batch, batch_idx):
+        images, masks = batch
+
+        loss, metrics, outputs = self(images, masks)
+        self.log_dict({
+            "test/Loss": loss,
+            "test/IoU": metrics['IoU'],
+            "test/Accuracy": metrics['Accuracy'],
+            "test/Precision": metrics['Precision'],
+            "test/Recall": metrics['Recall'],
+            "test/F1score": metrics['F1score']
+        }, prog_bar=True, logger=True, on_step=False, on_epoch=True)
+        return loss
+from torchinfo import summary
+
+model = SegmentationModel()
+summary(model, input_size=(BATCH_SIZE, 3, IMAGE_SIZE, IMAGE_SIZE))
+Downloading: "https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-regnet/regnety_120-721ba79a.pth" to /root/.cache/torch/hub/checkpoints/regnety_120-721ba79a.pth
+100%
+198M/198M [00:12<00:00, 9.04MB/s]
+/opt/conda/lib/python3.7/site-packages/segmentation_models_pytorch/base/modules.py:116: UserWarning: Implicit dimension choice for softmax has been deprecated. Change the call to include dim=X as an argument.
+  return self.activation(x)
+=========================================================================================================
+Layer (type:depth-idx)                                  Output Shape              Param #
+=========================================================================================================
+SegmentationModel                                       [16, 7, 320, 320]         --
+├─UnetPlusPlus: 1-1                                     [16, 7, 320, 320]         --
+│    └─RegNetEncoder: 2-1                               [16, 3, 320, 320]         --
+│    │    └─ConvBnAct: 3-1                              [16, 32, 160, 160]        928
+│    │    └─RegStage: 3-2                               [16, 224, 80, 80]         648,768
+│    │    └─RegStage: 3-3                               [16, 448, 40, 40]         4,733,624
+│    │    └─RegStage: 3-4                               [16, 896, 20, 20]         31,884,720
+│    │    └─RegStage: 3-5                               [16, 2240, 10, 10]        12,313,504
+│    └─UnetPlusPlusDecoder: 2-2                         [16, 16, 320, 320]        --
+│    └─SegmentationHead: 2-3                            [16, 7, 320, 320]         --
+│    │    └─Conv2d: 3-6                                 [16, 7, 320, 320]         1,015
+│    │    └─Identity: 3-7                               [16, 7, 320, 320]         --
+│    │    └─Activation: 3-8                             [16, 7, 320, 320]         --
+├─DiceLoss: 1-2                                         --                        --
+=========================================================================================================
+Total params: 71,013,407
+Trainable params: 71,013,407
+Non-trainable params: 0
+Total mult-adds (T): 1.29
+=========================================================================================================
+Input size (MB): 19.66
+Forward/backward pass size (MB): 10393.85
+Params size (MB): 283.67
+Estimated Total Size (MB): 10697.18
+=========================================================================================================
+Train the Model
+from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
+from pytorch_lightning.loggers import CSVLogger
+
+checkpoint_callback = ModelCheckpoint(
+    dirpath="checkpoints",
+    filename="best-checkpoint",
+    save_top_k=1,
+    verbose=True,
+    monitor="val/F1score",
+    mode="min"
+)
+
+logger = CSVLogger("lightning_logs", name="landcover-classification-log")
+
+early_stopping_callback = EarlyStopping(monitor="val/Accuracy", patience=5)
+
+trainer = pl.Trainer(
+    logger=logger,
+    log_every_n_steps=31,
+    callbacks=[checkpoint_callback, early_stopping_callback],
+    max_epochs=EPOCHS,
+    accelerator="gpu",
+    devices=1
+)
+trainer.fit(model, data_module)
+Sanity Checking DataLoader 0: 100%
+2/2 [00:02<00:00, 1.02s/it]
+Epoch 4: 100%
+47/47 [01:58<00:00, 2.52s/it, loss=0.18, v_num=0, val/Loss=0.194, val/IoU=0.979, val/Accuracy=0.997, val/Precision=0.989, val/Recall=0.989, val/F1score=0.989, train/Loss=0.193, train/IoU=0.958, train/Accuracy=0.994, train/Precision=0.978, train/Recall=0.978, train/F1score=0.978]
+Validation DataLoader 0: 100%
+16/16 [00:25<00:00, 1.62s/it]
+Validation DataLoader 0: 100%
+16/16 [00:24<00:00, 1.51s/it]
+Validation DataLoader 0: 100%
+16/16 [00:23<00:00, 1.47s/it]
+Validation DataLoader 0: 100%
+16/16 [00:24<00:00, 1.50s/it]
+Validation DataLoader 0: 100%
+16/16 [00:24<00:00, 1.52s/it]
+Test the Model
+trainer.test(model, data_module)
+Testing DataLoader 0: 100%
+26/26 [00:44<00:00, 1.72s/it]
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃        Test metric        ┃       DataLoader 0        ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│       test/Accuracy       │     0.996791422367096     │
+│       test/F1score        │    0.9887697100639343     │
+│         test/IoU          │    0.9780377149581909     │
+│         test/Loss         │    0.17993274331092834    │
+│      test/Precision       │    0.9887697100639343     │
+│        test/Recall        │    0.9887697100639343     │
+└───────────────────────────┴───────────────────────────┘
+[{'test/Loss': 0.17993274331092834,
+  'test/IoU': 0.9780377149581909,
+  'test/Accuracy': 0.996791422367096,
+  'test/Precision': 0.9887697100639343,
+  'test/Recall': 0.9887697100639343,
+  'test/F1score': 0.9887697100639343}]
+metrics = pd.read_csv("./lightning_logs/landcover-classification-log/version_0/metrics.csv")
+fig, ((ax1, ax2, ax3), (ax4, ax5, ax6)) = plt.subplots(2, 3, figsize=(18, 10))
+
+axes = [ax1, ax2, ax3, ax4, ax5, ax6]
+names = ['Loss', 'IoU', 'Accuracy', 'Precision', 'Recall', 'F1score']
+
+for axis, name in zip(axes, names):
+    axis.plot(metrics[f'train/{name}'].dropna())
+    axis.plot(metrics[f'val/{name}'].dropna())
+    axis.set_title(f'{name}: Train/Val')
+    axis.set_ylabel(name)
+    axis.set_xlabel('Epoch')
+    ax1.legend(['training', 'validation'], loc="upper right")
+
+ 
